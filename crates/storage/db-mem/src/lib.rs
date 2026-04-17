@@ -48,71 +48,75 @@ use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError};
 
 /// Raw byte-level storage for a single database table.
 ///
-/// Plain tables use `key → value`. `DupSort` tables use `key → Vec<value>` where
-/// values within each key are kept in sorted order.
-#[derive(Clone, Debug, Default)]
-struct TableStore {
-    /// `key_bytes → value_bytes`
-    data: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// When `true` the table is a `DupSort` table where a single key maps to
-    /// multiple values. The values for each key are stored concatenated inside
-    /// `data` using a secondary `BTreeMap` that is serialised as the map value.
-    ///
-    /// For simplicity we store `DupSort` data as:
-    ///   `key_bytes` → serialised `BTreeMap<value_bytes, ()>`
-    /// using a thin newtype wrapper so that plain-table and dupsort-table logic
-    /// stays in the same structure.
-    dupsort: bool,
+/// `Plain` tables use `key → value`. `DupSort` tables use `key → {value₁, value₂, …}`
+/// where values within each key are kept in sorted order via a `BTreeSet`.
+#[derive(Clone, Debug)]
+enum TableStore {
+    /// A regular table: `key_bytes → value_bytes`.
+    Plain(BTreeMap<Vec<u8>, Vec<u8>>),
+    /// A `DUPSORT` table: `key_bytes → BTreeSet<value_bytes>`.
+    DupSort(BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>),
 }
 
 impl TableStore {
-    const fn plain() -> Self {
-        Self { data: BTreeMap::new(), dupsort: false }
-    }
-
-    const fn dupsort() -> Self {
-        Self { data: BTreeMap::new(), dupsort: true }
+    /// Whether this table is a `DupSort` table.
+    const fn is_dupsort(&self) -> bool {
+        matches!(self, Self::DupSort(_))
     }
 
     // ── plain table helpers ───────────────────────────────────────────────
 
     fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
-        self.data.get(key)
+        match self {
+            Self::Plain(data) => data.get(key),
+            Self::DupSort(_) => None,
+        }
     }
 
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.data.insert(key, value);
+        match self {
+            Self::Plain(data) => {
+                data.insert(key, value);
+            }
+            Self::DupSort(_) => {}
+        }
     }
 
     fn remove(&mut self, key: &[u8]) -> bool {
-        self.data.remove(key).is_some()
+        match self {
+            Self::Plain(data) => data.remove(key).is_some(),
+            Self::DupSort(_) => false,
+        }
     }
 
     fn clear(&mut self) {
-        self.data.clear();
+        match self {
+            Self::Plain(data) => data.clear(),
+            Self::DupSort(data) => data.clear(),
+        }
     }
 
     fn len(&self) -> usize {
-        if self.dupsort {
-            self.data.values().map(|v| dup_value_count(v)).sum()
-        } else {
-            self.data.len()
+        match self {
+            Self::Plain(data) => data.len(),
+            Self::DupSort(data) => data.values().map(|s| s.len()).sum(),
         }
     }
 
     /// Returns all entries as sorted `(key, value)` pairs.
-    /// For `DupSort` tables this flattens the inner maps.
+    /// For `DupSort` tables this flattens the inner sets.
     fn entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        if self.dupsort {
-            let mut out = Vec::new();
-            for (k, raw) in &self.data {
-                for v in dup_values(raw) {
-                    out.push((k.clone(), v));
+        match self {
+            Self::Plain(data) => data.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Self::DupSort(data) => {
+                let mut out = Vec::new();
+                for (k, set) in data {
+                    for v in set {
+                        out.push((k.clone(), v.clone()));
+                    }
                 }
+                out
             }
-            out
-        } else {
-            self.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         }
     }
 
@@ -120,72 +124,39 @@ impl TableStore {
 
     /// Get all values for a given key (`DupSort` only).
     fn dup_get_values(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        self.data.get(key).map(|raw| dup_values(raw)).unwrap_or_default()
+        match self {
+            Self::DupSort(data) => {
+                data.get(key).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+            }
+            Self::Plain(_) => Vec::new(),
+        }
     }
 
     /// Insert a value into the `DupSort` value-set for `key`.
     fn dup_put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        let raw = self.data.entry(key).or_default();
-        let mut set = dup_decode(raw);
-        set.insert(value);
-        *raw = dup_encode(&set);
+        if let Self::DupSort(data) = self {
+            data.entry(key).or_default().insert(value);
+        }
     }
 
     /// Remove all values for a given key (`DupSort` only).
     fn dup_remove_key(&mut self, key: &[u8]) {
-        self.data.remove(key);
+        if let Self::DupSort(data) = self {
+            data.remove(key);
+        }
     }
 
     /// Remove a specific value for a given key (`DupSort` only).
     fn dup_remove_value(&mut self, key: &[u8], value: &[u8]) {
-        if let Some(raw) = self.data.get_mut(key) {
-            let mut set = dup_decode(raw);
+        if let Self::DupSort(data) = self &&
+            let Some(set) = data.get_mut(key)
+        {
             set.remove(value);
             if set.is_empty() {
-                self.data.remove(key);
-            } else {
-                *raw = dup_encode(&set);
+                data.remove(key);
             }
         }
     }
-}
-
-// ── DupSort value-set codec ───────────────────────────────────────────────────
-// We store DupSort values as: len_prefix(4 bytes BE) ++ value for each entry,
-// sorted lexicographically (BTreeMap provides that).
-
-fn dup_encode(set: &BTreeSet<Vec<u8>>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for k in set {
-        let len = k.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(k);
-    }
-    out
-}
-
-fn dup_decode(raw: &[u8]) -> BTreeSet<Vec<u8>> {
-    let mut set = BTreeSet::new();
-    let mut pos = 0;
-    while pos + 4 <= raw.len() {
-        let len = u32::from_be_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + len <= raw.len() {
-            set.insert(raw[pos..pos + len].to_vec());
-            pos += len;
-        } else {
-            break;
-        }
-    }
-    set
-}
-
-fn dup_values(raw: &[u8]) -> Vec<Vec<u8>> {
-    dup_decode(raw).into_iter().collect()
-}
-
-fn dup_value_count(raw: &[u8]) -> usize {
-    dup_decode(raw).len()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,53 +263,21 @@ impl DatabaseMetrics for MemoryDatabase {}
 // Table registration
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Register all reth tables into the Inner map.
+/// Register all reth tables into the Inner map.
+///
+/// Tables are registered in the same order as the canonical `tables!` macro in
+/// `reth-db-api` so that DBI indices match the MDBX implementation.
 fn register_tables(inner: &mut Inner) {
-    use reth_db_api::tables::*;
+    use reth_db_api::tables::Tables;
 
-    macro_rules! reg {
-        (plain: $($t:ty),* $(,)?) => {
-            $( inner.tables.insert(<$t>::NAME, TableStore::plain()); )*
+    for table in Tables::ALL {
+        let store = if table.is_dupsort() {
+            TableStore::DupSort(BTreeMap::new())
+        } else {
+            TableStore::Plain(BTreeMap::new())
         };
-        (dup: $($t:ty),* $(,)?) => {
-            $( inner.tables.insert(<$t>::NAME, TableStore::dupsort()); )*
-        };
+        inner.tables.insert(table.name(), store);
     }
-
-    reg!(plain:
-        CanonicalHeaders,
-        HeaderTerminalDifficulties,
-        HeaderNumbers,
-        Headers,
-        BlockBodyIndices,
-        BlockOmmers,
-        BlockWithdrawals,
-        Transactions,
-        TransactionHashNumbers,
-        TransactionBlocks,
-        Receipts,
-        Bytecodes,
-        PlainAccountState,
-        HashedAccounts,
-        AccountsTrie,
-        TransactionSenders,
-        StageCheckpoints,
-        StageCheckpointProgresses,
-        PruneCheckpoints,
-        VersionHistory,
-        ChainState,
-        Metadata,
-    );
-
-    reg!(dup:
-        PlainStorageState,
-        AccountChangeSets,
-        StorageChangeSets,
-        HashedStorages,
-        StoragesTrie,
-        AccountsHistory,
-        StoragesHistory,
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,7 +416,7 @@ impl DbTxMut for MemoryTxMut {
         let val_bytes = encode_value::<T>(&value);
         let mut overlay = self.overlay.lock();
         let store = overlay.table_mut(T::NAME);
-        if store.dupsort {
+        if store.is_dupsort() {
             store.dup_put(key_bytes, val_bytes);
         } else {
             store.put(key_bytes, val_bytes);
@@ -493,7 +432,7 @@ impl DbTxMut for MemoryTxMut {
         let key_bytes = key.encode().into_vec();
         let mut overlay = self.overlay.lock();
         let store = overlay.table_mut(T::NAME);
-        if store.dupsort {
+        if store.is_dupsort() {
             if let Some(v) = value {
                 let val_bytes = encode_value::<T>(&v);
                 let had = store.dup_get_values(&key_bytes).contains(&val_bytes);
