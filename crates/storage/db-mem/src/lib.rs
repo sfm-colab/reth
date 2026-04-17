@@ -1,7 +1,7 @@
 //! In-memory [`Database`] implementation for reth dev nodes.
 //!
 //! Provides a fully functional, in-memory replacement for the MDBX-backed
-//! `DatabaseEnv`` — no libmdbx dependency, no filesystem I/O.
+//! `DatabaseEnv` — no libmdbx dependency, no filesystem I/O.
 //!
 //! # Architecture
 //!
@@ -20,7 +20,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     ops::{Bound, RangeBounds},
     path::PathBuf,
@@ -48,29 +48,29 @@ use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError};
 
 /// Raw byte-level storage for a single database table.
 ///
-/// Plain tables use `key → value`. DupSort tables use `key → Vec<value>` where
+/// Plain tables use `key → value`. `DupSort` tables use `key → Vec<value>` where
 /// values within each key are kept in sorted order.
 #[derive(Clone, Debug, Default)]
 struct TableStore {
     /// `key_bytes → value_bytes`
     data: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// When `true` the table is a DupSort table where a single key maps to
+    /// When `true` the table is a `DupSort` table where a single key maps to
     /// multiple values. The values for each key are stored concatenated inside
     /// `data` using a secondary `BTreeMap` that is serialised as the map value.
     ///
-    /// For simplicity we store DupSort data as:
-    ///   key_bytes → serialised `BTreeMap<value_bytes, ()>`
+    /// For simplicity we store `DupSort` data as:
+    ///   `key_bytes` → serialised `BTreeMap<value_bytes, ()>`
     /// using a thin newtype wrapper so that plain-table and dupsort-table logic
     /// stays in the same structure.
     dupsort: bool,
 }
 
 impl TableStore {
-    fn plain() -> Self {
+    const fn plain() -> Self {
         Self { data: BTreeMap::new(), dupsort: false }
     }
 
-    fn dupsort() -> Self {
+    const fn dupsort() -> Self {
         Self { data: BTreeMap::new(), dupsort: true }
     }
 
@@ -101,11 +101,9 @@ impl TableStore {
     }
 
     /// Returns all entries as sorted `(key, value)` pairs.
-    /// For DupSort tables this flattens the inner maps.
+    /// For `DupSort` tables this flattens the inner maps.
     fn entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        if !self.dupsort {
-            self.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        } else {
+        if self.dupsort {
             let mut out = Vec::new();
             for (k, raw) in &self.data {
                 for v in dup_values(raw) {
@@ -113,38 +111,40 @@ impl TableStore {
                 }
             }
             out
+        } else {
+            self.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         }
     }
 
     // ── DupSort helpers ───────────────────────────────────────────────────
 
-    /// Get all values for a given key (DupSort only).
+    /// Get all values for a given key (`DupSort` only).
     fn dup_get_values(&self, key: &[u8]) -> Vec<Vec<u8>> {
         self.data.get(key).map(|raw| dup_values(raw)).unwrap_or_default()
     }
 
-    /// Insert a value into the DupSort value-set for `key`.
+    /// Insert a value into the `DupSort` value-set for `key`.
     fn dup_put(&mut self, key: Vec<u8>, value: Vec<u8>) {
         let raw = self.data.entry(key).or_default();
-        let mut map = dup_decode(raw);
-        map.insert(value, ());
-        *raw = dup_encode(&map);
+        let mut set = dup_decode(raw);
+        set.insert(value);
+        *raw = dup_encode(&set);
     }
 
-    /// Remove all values for a given key (DupSort only).
+    /// Remove all values for a given key (`DupSort` only).
     fn dup_remove_key(&mut self, key: &[u8]) {
         self.data.remove(key);
     }
 
-    /// Remove a specific value for a given key (DupSort only).
+    /// Remove a specific value for a given key (`DupSort` only).
     fn dup_remove_value(&mut self, key: &[u8], value: &[u8]) {
         if let Some(raw) = self.data.get_mut(key) {
-            let mut map = dup_decode(raw);
-            map.remove(value);
-            if map.is_empty() {
+            let mut set = dup_decode(raw);
+            set.remove(value);
+            if set.is_empty() {
                 self.data.remove(key);
             } else {
-                *raw = dup_encode(&map);
+                *raw = dup_encode(&set);
             }
         }
     }
@@ -154,9 +154,9 @@ impl TableStore {
 // We store DupSort values as: len_prefix(4 bytes BE) ++ value for each entry,
 // sorted lexicographically (BTreeMap provides that).
 
-fn dup_encode(map: &BTreeMap<Vec<u8>, ()>) -> Vec<u8> {
+fn dup_encode(set: &BTreeSet<Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();
-    for k in map.keys() {
+    for k in set {
         let len = k.len() as u32;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(k);
@@ -164,24 +164,24 @@ fn dup_encode(map: &BTreeMap<Vec<u8>, ()>) -> Vec<u8> {
     out
 }
 
-fn dup_decode(raw: &[u8]) -> BTreeMap<Vec<u8>, ()> {
-    let mut map = BTreeMap::new();
+fn dup_decode(raw: &[u8]) -> BTreeSet<Vec<u8>> {
+    let mut set = BTreeSet::new();
     let mut pos = 0;
     while pos + 4 <= raw.len() {
         let len = u32::from_be_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         if pos + len <= raw.len() {
-            map.insert(raw[pos..pos + len].to_vec(), ());
+            set.insert(raw[pos..pos + len].to_vec());
             pos += len;
         } else {
             break;
         }
     }
-    map
+    set
 }
 
 fn dup_values(raw: &[u8]) -> Vec<Vec<u8>> {
-    dup_decode(raw).into_keys().collect()
+    dup_decode(raw).into_iter().collect()
 }
 
 fn dup_value_count(raw: &[u8]) -> usize {
@@ -572,7 +572,7 @@ impl<T: Table> fmt::Debug for MemoryCursor<T> {
 }
 
 impl<T: Table> MemoryCursor<T> {
-    fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+    const fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         Self { entries, pos: None, _marker: std::marker::PhantomData }
     }
 
@@ -637,11 +637,7 @@ impl<T: Table> DbCursorRO<T> for MemoryCursor<T> {
             None => None,
             Some(i) => {
                 let next = i + 1;
-                if next < self.entries.len() {
-                    Some(next)
-                } else {
-                    None
-                }
+                (next < self.entries.len()).then_some(next)
             }
         };
         self.current_kv()
@@ -649,8 +645,7 @@ impl<T: Table> DbCursorRO<T> for MemoryCursor<T> {
 
     fn prev(&mut self) -> PairResult<T> {
         self.pos = match self.pos {
-            None => None,
-            Some(0) => None,
+            None | Some(0) => None,
             Some(i) => Some(i - 1),
         };
         self.current_kv()
@@ -764,7 +759,7 @@ impl<T: Table> fmt::Debug for MemoryWriteCursor<T> {
 }
 
 impl<T: Table> MemoryWriteCursor<T> {
-    fn new(entries: Vec<(Vec<u8>, Vec<u8>)>, overlay: Arc<OverlayMutex>) -> Self {
+    const fn new(entries: Vec<(Vec<u8>, Vec<u8>)>, overlay: Arc<OverlayMutex>) -> Self {
         Self { inner: MemoryCursor::new(entries), overlay, table_name: T::NAME }
     }
 
@@ -776,9 +771,7 @@ impl<T: Table> MemoryWriteCursor<T> {
         // Reposition cursor to same key (or nearest).
         if let Some(key) = current_key {
             match self.inner.entries.binary_search_by(|(k, _)| k.as_slice().cmp(&key)) {
-                Ok(i) | Err(i) => {
-                    self.inner.pos = if i < self.inner.entries.len() { Some(i) } else { None }
-                }
+                Ok(i) | Err(i) => self.inner.pos = (i < self.inner.entries.len()).then_some(i),
             }
         }
     }
@@ -925,7 +918,7 @@ impl<T: Table> DbCursorRW<T> for MemoryWriteCursor<T> {
 // MemoryDupCursor — read-only DupSort cursor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A read-only cursor over a DupSort table.
+/// A read-only cursor over a `DupSort` table.
 ///
 /// Internally treats the flattened `(key, value)` pairs the same as
 /// [`MemoryCursor`] — the dupsort grouping is handled by key equality.
@@ -940,7 +933,7 @@ impl<T: DupSort> fmt::Debug for MemoryDupCursor<T> {
 }
 
 impl<T: DupSort> MemoryDupCursor<T> {
-    fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+    const fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         Self { inner: MemoryCursor::new(entries) }
     }
 
@@ -1049,11 +1042,11 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupCursor<T> {
             Some(k) => k,
         };
         let prev_pos = self.inner.pos.and_then(|i| i.checked_sub(1));
-        if let Some(pos) = prev_pos {
-            if self.inner.entries[pos].0 == cur_key {
-                self.inner.pos = Some(pos);
-                return self.inner.current_kv();
-            }
+        if let Some(pos) = prev_pos &&
+            self.inner.entries[pos].0 == cur_key
+        {
+            self.inner.pos = Some(pos);
+            return self.inner.current_kv();
         }
         Ok(None)
     }
@@ -1065,11 +1058,12 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupCursor<T> {
         };
         // peek at next
         let next_pos = self.inner.pos.map(|i| i + 1);
-        if let Some(pos) = next_pos {
-            if pos < self.inner.entries.len() && self.inner.entries[pos].0 == cur_key {
-                self.inner.pos = Some(pos);
-                return self.inner.current_kv();
-            }
+        if let Some(pos) = next_pos &&
+            pos < self.inner.entries.len() &&
+            self.inner.entries[pos].0 == cur_key
+        {
+            self.inner.pos = Some(pos);
+            return self.inner.current_kv();
         }
         Ok(None)
     }
@@ -1086,7 +1080,7 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupCursor<T> {
                 Some((k, v)) if k.clone().encode().as_ref() != cur_key.as_slice() => {
                     return Ok(Some((k, v)));
                 }
-                _ => continue,
+                _ => {}
             }
         }
     }
@@ -1102,17 +1096,13 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupCursor<T> {
         };
         // advance to last entry with the same key
         let mut last_val = None;
-        loop {
-            if let Some(i) = self.inner.pos {
-                if i < self.inner.entries.len() && self.inner.entries[i].0 == cur_key {
-                    last_val = Some(self.inner.entries[i].1.clone());
-                    self.inner.pos = Some(i + 1);
-                } else {
-                    // step back to last matching
-                    self.inner.pos = Some(i.saturating_sub(1));
-                    break;
-                }
+        while let Some(i) = self.inner.pos {
+            if i < self.inner.entries.len() && self.inner.entries[i].0 == cur_key {
+                last_val = Some(self.inner.entries[i].1.clone());
+                self.inner.pos = Some(i + 1);
             } else {
+                // step back to last matching
+                self.inner.pos = Some(i.saturating_sub(1));
                 break;
             }
         }
@@ -1133,7 +1123,7 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupCursor<T> {
         match self.inner.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key_bytes)) {
             Err(_) => {
                 self.inner.pos = None;
-                return Ok(None);
+                Ok(None)
             }
             Ok(mut i) => {
                 // binary_search may land in the middle of dups — walk back to first
@@ -1186,7 +1176,7 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupCursor<T> {
 // MemoryDupWriteCursor — read-write DupSort cursor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A read-write cursor over a DupSort table.
+/// A read-write cursor over a `DupSort` table.
 pub struct MemoryDupWriteCursor<T: DupSort> {
     inner: MemoryDupCursor<T>,
     overlay: Arc<OverlayMutex>,
@@ -1200,7 +1190,7 @@ impl<T: DupSort> fmt::Debug for MemoryDupWriteCursor<T> {
 }
 
 impl<T: DupSort> MemoryDupWriteCursor<T> {
-    fn new(entries: Vec<(Vec<u8>, Vec<u8>)>, overlay: Arc<OverlayMutex>) -> Self {
+    const fn new(entries: Vec<(Vec<u8>, Vec<u8>)>, overlay: Arc<OverlayMutex>) -> Self {
         Self { inner: MemoryDupCursor::new(entries), overlay, table_name: T::NAME }
     }
 
@@ -1214,8 +1204,7 @@ impl<T: DupSort> MemoryDupWriteCursor<T> {
                 ek.as_slice().cmp(&k).then_with(|| ev.as_slice().cmp(&v))
             }) {
                 Ok(i) | Err(i) => {
-                    self.inner.inner.pos =
-                        if i < self.inner.inner.entries.len() { Some(i) } else { None }
+                    self.inner.inner.pos = (i < self.inner.inner.entries.len()).then_some(i)
                 }
             }
         }
@@ -1344,9 +1333,8 @@ impl<T: DupSort> DbDupCursorRO<T> for MemoryDupWriteCursor<T> {
         Self: Sized,
     {
         let start = match (key, subkey) {
-            (None, None) => self.first(),
             (Some(k), None) => self.seek_exact(k),
-            (None, Some(_)) => self.first(),
+            (None, _) => self.first(),
             (Some(k), Some(sk)) => self
                 .seek_by_key_subkey(k, sk)
                 .map(|v| v.and_then(|_| self.inner.inner.current_kv().ok().flatten())),
