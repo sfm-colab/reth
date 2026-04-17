@@ -1,0 +1,23 @@
+[package]
+name = "reth-db-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "In-memory database implementation for reth dev nodes."
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-db-api.workspace = true
+reth-storage-errors.workspace = true
+
+parking_lot.workspace = true
+
+[dev-dependencies]
+reth-db-api = { workspace = true, features = ["test-utils"] }
+reth-primitives-traits.workspace = true
+alloy-primitives.workspace = true
