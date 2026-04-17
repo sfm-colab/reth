@@ -1,7 +1,7 @@
 //! In-memory [`Database`] implementation for reth dev nodes.
 //!
 //! Provides a fully functional, in-memory replacement for the MDBX-backed
-//! [`DatabaseEnv`](reth_db::DatabaseEnv) — no libmdbx dependency, no filesystem I/O.
+//! `DatabaseEnv`` — no libmdbx dependency, no filesystem I/O.
 //!
 //! # Architecture
 //!
