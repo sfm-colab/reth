@@ -27,7 +27,7 @@ use std::{
     sync::Arc,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reth_db_api::{
     common::{PairResult, ValueOnlyResult},
     cursor::{
@@ -69,7 +69,7 @@ impl TableStore {
     fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
         match self {
             Self::Plain(data) => data.get(key),
-            Self::DupSort(_) => None,
+            Self::DupSort(data) => data.get(key).and_then(|set| set.iter().next()),
         }
     }
 
@@ -190,6 +190,8 @@ impl Inner {
 #[derive(Clone, Debug)]
 pub struct MemoryDatabase {
     inner: Arc<RwLock<Inner>>,
+    /// Ensures only one write transaction is active at a time, matching MDBX semantics.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl Default for MemoryDatabase {
@@ -203,7 +205,7 @@ impl MemoryDatabase {
     pub fn new() -> Self {
         let mut inner = Inner::default();
         register_tables(&mut inner);
-        Self { inner: Arc::new(RwLock::new(inner)) }
+        Self { inner: Arc::new(RwLock::new(inner)), write_lock: Arc::new(Mutex::new(())) }
     }
 
     /// Snapshot the entire database state for later restoration (e.g. `anvil_snapshot`).
@@ -237,10 +239,16 @@ impl Database for MemoryDatabase {
     }
 
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
+        // Block until no other write transaction is active, matching MDBX semantics.
+        // We use `lock()` then `mem::forget` the guard so the mutex stays locked
+        // until `MemoryTxMut` is dropped, which calls `force_unlock`.
+        let guard = self.write_lock.lock();
+        std::mem::forget(guard);
         let snapshot = self.inner.read().clone();
         Ok(MemoryTxMut {
             overlay: Arc::new(parking_lot::Mutex::new(snapshot)),
             db: Arc::clone(&self.inner),
+            write_lock: Arc::clone(&self.write_lock),
         })
     }
 
@@ -348,11 +356,21 @@ pub struct MemoryTxMut {
     overlay: Arc<OverlayMutex>,
     /// Handle to the shared database state (for commit).
     db: Arc<RwLock<Inner>>,
+    /// Held locked for the lifetime of the transaction to enforce single-writer semantics.
+    /// Unlocked on drop.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for MemoryTxMut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemoryTxMut").finish_non_exhaustive()
+    }
+}
+
+impl Drop for MemoryTxMut {
+    fn drop(&mut self) {
+        // SAFETY: the mutex was locked via `lock()` + `mem::forget(guard)` in `tx_mut()`.
+        unsafe { self.write_lock.force_unlock() };
     }
 }
 
@@ -378,15 +396,15 @@ impl DbTx for MemoryTxMut {
     }
 
     fn commit(self) -> Result<(), DatabaseError> {
-        let overlay = Arc::try_unwrap(self.overlay)
-            .unwrap_or_else(|arc| parking_lot::Mutex::new(arc.lock().clone()))
-            .into_inner();
+        let overlay = self.overlay.lock().clone();
         let mut db = self.db.write();
         *db = overlay;
         Ok(())
     }
 
-    fn abort(self) {}
+    fn abort(self) {
+        // Drop impl releases the write lock.
+    }
 
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
         let overlay = self.overlay.lock();
