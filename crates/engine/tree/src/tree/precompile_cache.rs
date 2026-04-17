@@ -246,6 +246,7 @@ mod tests {
                 gas_used: 0,
                 state_gas_used: 0,
                 reservoir: 0,
+                gas_refunded: 0,
                 bytes: Bytes::default(),
             })
         })
@@ -259,6 +260,7 @@ mod tests {
             gas_used: 50,
             state_gas_used: 0,
             reservoir: 0,
+            gas_refunded: 0,
             bytes: alloy_primitives::Bytes::copy_from_slice(b"cached_result"),
         };
 
@@ -292,6 +294,7 @@ mod tests {
                     gas_used: 5000,
                     state_gas_used: 0,
                     reservoir: 0,
+                    gas_refunded: 0,
                     bytes: alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_1"),
                 })
             }
@@ -308,6 +311,7 @@ mod tests {
                     gas_used: 7000,
                     state_gas_used: 0,
                     reservoir: 0,
+                    gas_refunded: 0,
                     bytes: alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_2"),
                 })
             }
