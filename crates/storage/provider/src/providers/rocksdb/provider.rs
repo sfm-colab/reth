@@ -436,6 +436,11 @@ enum RocksDBProviderInner {
         /// Temporary directory for secondary LOG files, removed on drop.
         secondary_path: PathBuf,
     },
+    /// No-op provider used when auxiliary `RocksDB` storage is disabled.
+    Noop {
+        /// Placeholder path for debug output and API compatibility.
+        path: PathBuf,
+    },
 }
 
 impl RocksDBProviderInner {
@@ -443,6 +448,7 @@ impl RocksDBProviderInner {
     const fn metrics(&self) -> Option<&RocksDBMetrics> {
         match self {
             Self::ReadWrite { metrics, .. } | Self::Secondary { metrics, .. } => metrics.as_ref(),
+            Self::Noop { .. } => None,
         }
     }
 
@@ -453,6 +459,7 @@ impl RocksDBProviderInner {
             Self::Secondary { .. } => {
                 panic!("Cannot perform write operation on secondary RocksDB provider")
             }
+            Self::Noop { .. } => panic!("Cannot perform write operation on noop RocksDB provider"),
         }
     }
 
@@ -461,6 +468,7 @@ impl RocksDBProviderInner {
         let cf = match self {
             Self::ReadWrite { db, .. } => db.cf_handle(T::NAME),
             Self::Secondary { db, .. } => db.cf_handle(T::NAME),
+            Self::Noop { .. } => None,
         };
         cf.ok_or_else(|| DatabaseError::Other(format!("Column family '{}' not found", T::NAME)))
     }
@@ -474,6 +482,7 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => db.get_cf(cf, key),
             Self::Secondary { db, .. } => db.get_cf(cf, key),
+            Self::Noop { .. } => Ok(None),
         }
     }
 
@@ -515,6 +524,7 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => RocksDBIterEnum::ReadWrite(db.iterator_cf(cf, mode)),
             Self::Secondary { db, .. } => RocksDBIterEnum::ReadOnly(db.iterator_cf(cf, mode)),
+            Self::Noop { .. } => RocksDBIterEnum::Empty,
         }
     }
 
@@ -526,6 +536,7 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => RocksDBRawIterEnum::ReadWrite(db.raw_iterator_cf(cf)),
             Self::Secondary { db, .. } => RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf(cf)),
+            Self::Noop { .. } => RocksDBRawIterEnum::Empty,
         }
     }
 
@@ -534,6 +545,7 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => RocksReadSnapshotInner::ReadWrite(db.snapshot()),
             Self::Secondary { db, .. } => RocksReadSnapshotInner::Secondary(db),
+            Self::Noop { .. } => RocksReadSnapshotInner::Noop,
         }
     }
 
@@ -542,6 +554,7 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => db.path(),
             Self::Secondary { db, .. } => db.path(),
+            Self::Noop { path } => path.as_path(),
         }
     }
 
@@ -616,6 +629,7 @@ impl RocksDBProviderInner {
         match self {
             Self::ReadWrite { db, .. } => collect_stats!(db),
             Self::Secondary { db, .. } => collect_stats!(db),
+            Self::Noop { .. } => {}
         }
 
         stats
@@ -640,6 +654,9 @@ impl fmt::Debug for RocksDBProviderInner {
                 .field("db", &"<DB (secondary)>")
                 .field("metrics", metrics)
                 .finish(),
+            Self::Noop { path } => {
+                f.debug_struct("RocksDBProviderInner::Noop").field("path", path).finish()
+            }
         }
     }
 }
@@ -666,6 +683,7 @@ impl Drop for RocksDBProviderInner {
                 db.cancel_all_background_work(true);
                 let _ = std::fs::remove_dir_all(secondary_path);
             }
+            Self::Noop { .. } => {}
         }
     }
 }
@@ -716,6 +734,11 @@ impl DatabaseMetrics for RocksDBProvider {
 }
 
 impl RocksDBProvider {
+    /// Creates a no-op `RocksDB` provider for legacy or in-memory storage layouts.
+    pub fn noop() -> Self {
+        Self(Arc::new(RocksDBProviderInner::Noop { path: PathBuf::new() }))
+    }
+
     /// Creates a new `RocksDB` provider.
     pub fn new(path: impl AsRef<Path>) -> ProviderResult<Self> {
         RocksDBBuilder::new(path).build()
@@ -737,6 +760,11 @@ impl RocksDBProvider {
     /// Returns `true` if this provider is in read-only mode.
     pub fn is_read_only(&self) -> bool {
         matches!(self.0.as_ref(), RocksDBProviderInner::Secondary { .. })
+    }
+
+    /// Returns `true` if this provider is the no-op variant.
+    pub fn is_noop(&self) -> bool {
+        matches!(self.0.as_ref(), RocksDBProviderInner::Noop { .. })
     }
 
     /// Tries to catch up with the primary instance by reading new WAL and MANIFEST entries.
@@ -832,6 +860,9 @@ impl RocksDBProvider {
 
     /// Gets a value from the specified table.
     pub fn get<T: Table>(&self, key: T::Key) -> ProviderResult<Option<T::Value>> {
+        if self.is_noop() {
+            return Ok(None);
+        }
         self.get_encoded::<T>(&key.encode())
     }
 
@@ -840,6 +871,9 @@ impl RocksDBProvider {
         &self,
         key: &<T::Key as Encode>::Encoded,
     ) -> ProviderResult<Option<T::Value>> {
+        if self.is_noop() {
+            return Ok(None);
+        }
         self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
             let result = this.0.get_cf(this.get_cf_handle::<T>()?, key.as_ref()).map_err(|e| {
                 ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
@@ -854,6 +888,9 @@ impl RocksDBProvider {
 
     /// Gets raw bytes from the specified table without decompressing.
     pub fn get_raw<T: Table>(&self, key: T::Key) -> ProviderResult<Option<Vec<u8>>> {
+        if self.is_noop() {
+            return Ok(None);
+        }
         let encoded = key.encode();
         self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
             this.0.get_cf(this.get_cf_handle::<T>()?, encoded.as_ref()).map_err(|e| {
@@ -883,6 +920,9 @@ impl RocksDBProvider {
         key: &<T::Key as Encode>::Encoded,
         value: &T::Value,
     ) -> ProviderResult<()> {
+        if self.is_noop() {
+            return Ok(());
+        }
         self.execute_with_operation_metric(RocksDBOperation::Put, T::NAME, |this| {
             // for simplify the code, we need allocate buf here each time because `RocksDBProvider`
             // is thread safe if user want to avoid allocate buf each time, they can use
@@ -906,6 +946,9 @@ impl RocksDBProvider {
     /// # Panics
     /// Panics if the provider is in read-only mode.
     pub fn delete<T: Table>(&self, key: T::Key) -> ProviderResult<()> {
+        if self.is_noop() {
+            return Ok(());
+        }
         self.execute_with_operation_metric(RocksDBOperation::Delete, T::NAME, |this| {
             this.0.delete_cf(this.get_cf_handle::<T>()?, key.encode().as_ref()).map_err(|e| {
                 ProviderError::Database(DatabaseError::Delete(DatabaseErrorInfo {
@@ -922,6 +965,9 @@ impl RocksDBProvider {
     /// This end key must exceed the maximum encoded key size for any table.
     /// Current max is ~60 bytes (`StorageShardedKey` = 20 + 32 + 8).
     pub fn clear<T: Table>(&self) -> ProviderResult<()> {
+        if self.is_noop() {
+            return Ok(());
+        }
         let cf = self.get_cf_handle::<T>()?;
 
         self.0.delete_range_cf(cf, &[] as &[u8], &[0xFF; 256]).map_err(|e| {
@@ -939,6 +985,9 @@ impl RocksDBProvider {
         &self,
         mode: IteratorMode<'_>,
     ) -> ProviderResult<Option<(T::Key, T::Value)>> {
+        if self.is_noop() {
+            return Ok(None);
+        }
         self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
             let cf = this.get_cf_handle::<T>()?;
             let mut iter = this.0.iterator_cf(cf, mode);
@@ -978,6 +1027,12 @@ impl RocksDBProvider {
     ///
     /// Returns decoded `(Key, Value)` pairs in key order.
     pub fn iter<T: Table>(&self) -> ProviderResult<RocksDBIter<'_, T>> {
+        if self.is_noop() {
+            return Ok(RocksDBIter {
+                inner: RocksDBIterEnum::Empty,
+                _marker: std::marker::PhantomData,
+            });
+        }
         let cf = self.get_cf_handle::<T>()?;
         let iter = self.0.iterator_cf(cf, IteratorMode::Start);
         Ok(RocksDBIter { inner: iter, _marker: std::marker::PhantomData })
@@ -987,6 +1042,12 @@ impl RocksDBProvider {
     ///
     /// Returns decoded `(Key, Value)` pairs starting from the first key >= `key`.
     pub fn iter_from<T: Table>(&self, key: T::Key) -> ProviderResult<RocksDBIter<'_, T>> {
+        if self.is_noop() {
+            return Ok(RocksDBIter {
+                inner: RocksDBIterEnum::Empty,
+                _marker: std::marker::PhantomData,
+            });
+        }
         let cf = self.get_cf_handle::<T>()?;
         let encoded_key = key.encode();
         let iter = self
@@ -1030,6 +1091,9 @@ impl RocksDBProvider {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(tables = ?tables))]
     pub fn flush(&self, tables: &[&'static str]) -> ProviderResult<()> {
+        if self.is_noop() {
+            return Ok(());
+        }
         let db = self.0.db_rw();
 
         for cf_name in tables {
@@ -1070,6 +1134,9 @@ impl RocksDBProvider {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
     pub fn flush_and_compact(&self) -> ProviderResult<()> {
+        if self.is_noop() {
+            return Ok(());
+        }
         self.flush(ROCKSDB_TABLES)?;
 
         let db = self.0.db_rw();
@@ -1087,6 +1154,9 @@ impl RocksDBProvider {
     ///
     /// Returns raw `(key_bytes, value_bytes)` pairs without decoding.
     pub fn raw_iter<T: Table>(&self) -> ProviderResult<RocksDBRawIter<'_>> {
+        if self.is_noop() {
+            return Ok(RocksDBRawIter { inner: RocksDBIterEnum::Empty });
+        }
         let cf = self.get_cf_handle::<T>()?;
         let iter = self.0.iterator_cf(cf, IteratorMode::Start);
         Ok(RocksDBRawIter { inner: iter })
@@ -1100,6 +1170,9 @@ impl RocksDBProvider {
         &self,
         address: Address,
     ) -> ProviderResult<Vec<(ShardedKey<Address>, BlockNumberList)>> {
+        if self.is_noop() {
+            return Ok(Vec::new());
+        }
         // Get the column family handle for the AccountsHistory table.
         let cf = self.get_cf_handle::<tables::AccountsHistory>()?;
 
@@ -1153,6 +1226,9 @@ impl RocksDBProvider {
         address: Address,
         storage_key: B256,
     ) -> ProviderResult<Vec<(StorageShardedKey, BlockNumberList)>> {
+        if self.is_noop() {
+            return Ok(Vec::new());
+        }
         let cf = self.get_cf_handle::<tables::StoragesHistory>()?;
 
         let start_key = StorageShardedKey::new(address, storage_key, 0u64);
@@ -1275,6 +1351,9 @@ impl RocksDBProvider {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(batch_len = batch.len(), batch_size = batch.size_in_bytes()))]
     pub fn commit_batch(&self, batch: WriteBatchWithTransaction<true>) -> ProviderResult<()> {
+        if self.is_noop() {
+            return Ok(());
+        }
         self.0.db_rw().write_opt(batch, &synced_write_options()).map_err(|e| {
             ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
                 message: e.to_string().into(),
@@ -1470,6 +1549,8 @@ enum RocksReadSnapshotInner<'db> {
     ReadWrite(SnapshotWithThreadMode<'db, OptimisticTransactionDB>),
     /// Direct reads from a secondary `DB` instance (no snapshot).
     Secondary(&'db DB),
+    /// Empty snapshot for the no-op provider.
+    Noop,
 }
 
 impl<'db> RocksReadSnapshotInner<'db> {
@@ -1478,6 +1559,7 @@ impl<'db> RocksReadSnapshotInner<'db> {
         match self {
             Self::ReadWrite(snap) => RocksDBRawIterEnum::ReadWrite(snap.raw_iterator_cf(cf)),
             Self::Secondary(db) => RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf(cf)),
+            Self::Noop => RocksDBRawIterEnum::Empty,
         }
     }
 }
@@ -1498,9 +1580,13 @@ impl<'db> RocksReadSnapshot<'db> {
 
     /// Gets a value from the specified table.
     pub fn get<T: Table>(&self, key: T::Key) -> ProviderResult<Option<T::Value>> {
+        if matches!(&self.inner, RocksReadSnapshotInner::Noop) {
+            return Ok(None);
+        }
         let encoded_key = key.encode();
         let cf = self.cf_handle::<T>()?;
         let result = match &self.inner {
+            RocksReadSnapshotInner::Noop => return Ok(None),
             RocksReadSnapshotInner::ReadWrite(snap) => snap.get_cf(cf, encoded_key.as_ref()),
             RocksReadSnapshotInner::Secondary(db) => db.get_cf(cf, encoded_key.as_ref()),
         }
@@ -1596,6 +1682,10 @@ impl<'db> RocksReadSnapshot<'db> {
             })
         };
 
+        if matches!(&self.inner, RocksReadSnapshotInner::Noop) {
+            return fallback();
+        }
+
         let cf = self.cf_handle::<T>()?;
         let mut iter = self.inner.raw_iterator_cf(cf);
 
@@ -1641,7 +1731,7 @@ impl<'db> RocksReadSnapshot<'db> {
             // later change. Without a previous shard for the same key, fall back to the existing
             // not-written / maybe-pruned result instead of routing into plain state.
             if found_block.is_none() && !has_prev {
-                return fallback()
+                return fallback();
             }
 
             !has_prev
@@ -1728,6 +1818,9 @@ impl<'a> RocksDBBatch<'a> {
         key: &<T::Key as Encode>::Encoded,
         value: &T::Value,
     ) -> ProviderResult<()> {
+        if self.provider.is_noop() {
+            return Ok(());
+        }
         let value_bytes = compress_to_buf_or_ref!(self.buf, value).unwrap_or(&self.buf);
         self.inner.put_cf(self.provider.get_cf_handle::<T>()?, key, value_bytes);
         self.maybe_auto_commit()?;
@@ -1738,6 +1831,9 @@ impl<'a> RocksDBBatch<'a> {
     ///
     /// If auto-commit is enabled and the batch exceeds the threshold, commits and resets.
     pub fn delete<T: Table>(&mut self, key: T::Key) -> ProviderResult<()> {
+        if self.provider.is_noop() {
+            return Ok(());
+        }
         self.inner.delete_cf(self.provider.get_cf_handle::<T>()?, key.encode().as_ref());
         self.maybe_auto_commit()?;
         Ok(())
@@ -1748,6 +1844,9 @@ impl<'a> RocksDBBatch<'a> {
     /// This is called after each `put` or `delete` operation to prevent unbounded memory growth.
     /// Returns immediately if auto-commit is disabled or threshold not reached.
     fn maybe_auto_commit(&mut self) -> ProviderResult<()> {
+        if self.provider.is_noop() {
+            return Ok(());
+        }
         if let Some(threshold) = self.auto_commit_threshold &&
             self.inner.size_in_bytes() >= threshold
         {
@@ -1776,6 +1875,9 @@ impl<'a> RocksDBBatch<'a> {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(batch_len = self.inner.len(), batch_size = self.inner.size_in_bytes()))]
     pub fn commit(self) -> ProviderResult<()> {
+        if self.provider.is_noop() {
+            return Ok(());
+        }
         self.provider.0.db_rw().write_opt(self.inner, &synced_write_options()).map_err(|e| {
             ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
                 message: e.to_string().into(),
@@ -2115,6 +2217,9 @@ impl<'a> RocksDBBatch<'a> {
         &mut self,
         targets: &[(Address, BlockNumber)],
     ) -> ProviderResult<PrunedIndices> {
+        if self.provider.is_noop() {
+            return Ok(PrunedIndices::default());
+        }
         if targets.is_empty() {
             return Ok(PrunedIndices::default());
         }
@@ -2242,6 +2347,9 @@ impl<'a> RocksDBBatch<'a> {
         &mut self,
         targets: &[((Address, B256), BlockNumber)],
     ) -> ProviderResult<PrunedIndices> {
+        if self.provider.is_noop() {
+            return Ok(PrunedIndices::default());
+        }
         if targets.is_empty() {
             return Ok(PrunedIndices::default());
         }
@@ -2567,6 +2675,8 @@ enum RocksDBIterEnum<'db> {
     ReadWrite(rocksdb::DBIteratorWithThreadMode<'db, OptimisticTransactionDB>),
     /// Iterator from read-only `DB`.
     ReadOnly(rocksdb::DBIteratorWithThreadMode<'db, DB>),
+    /// Empty iterator for the no-op provider.
+    Empty,
 }
 
 impl Iterator for RocksDBIterEnum<'_> {
@@ -2576,6 +2686,7 @@ impl Iterator for RocksDBIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.next(),
             Self::ReadOnly(iter) => iter.next(),
+            Self::Empty => None,
         }
     }
 }
@@ -2589,6 +2700,8 @@ enum RocksDBRawIterEnum<'db> {
     ReadWrite(DBRawIteratorWithThreadMode<'db, OptimisticTransactionDB>),
     /// Raw iterator from read-only `DB`.
     ReadOnly(DBRawIteratorWithThreadMode<'db, DB>),
+    /// Empty iterator for the no-op provider.
+    Empty,
 }
 
 impl RocksDBRawIterEnum<'_> {
@@ -2597,6 +2710,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.seek(key),
             Self::ReadOnly(iter) => iter.seek(key),
+            Self::Empty => {}
         }
     }
 
@@ -2605,6 +2719,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.valid(),
             Self::ReadOnly(iter) => iter.valid(),
+            Self::Empty => false,
         }
     }
 
@@ -2613,6 +2728,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.key(),
             Self::ReadOnly(iter) => iter.key(),
+            Self::Empty => None,
         }
     }
 
@@ -2621,6 +2737,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.value(),
             Self::ReadOnly(iter) => iter.value(),
+            Self::Empty => None,
         }
     }
 
@@ -2629,6 +2746,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.next(),
             Self::ReadOnly(iter) => iter.next(),
+            Self::Empty => {}
         }
     }
 
@@ -2637,6 +2755,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.prev(),
             Self::ReadOnly(iter) => iter.prev(),
+            Self::Empty => {}
         }
     }
 
@@ -2645,6 +2764,7 @@ impl RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite(iter) => iter.status(),
             Self::ReadOnly(iter) => iter.status(),
+            Self::Empty => Ok(()),
         }
     }
 }

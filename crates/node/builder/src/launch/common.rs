@@ -66,8 +66,8 @@ use reth_node_metrics::{
 };
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
-    BlockHashReader, BlockNumReader, ProviderError, ProviderFactory, ProviderResult,
-    RocksDBProviderFactory, StageCheckpointReader, StaticFileProviderBuilder,
+    BlockHashReader, BlockNumReader, MetadataProvider, ProviderError, ProviderFactory,
+    ProviderResult, RocksDBProviderFactory, StageCheckpointReader, StaticFileProviderBuilder,
     StaticFileProviderFactory,
 };
 use reth_prune::{PruneModes, PrunerBuilder};
@@ -490,25 +490,44 @@ where
                 .with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default())
                 .build()?;
 
-        // Use the provided RocksDB provider or create a new one
-        let rocksdb_provider = if let Some(provider) = rocksdb_provider {
-            provider
-        } else {
-            RocksDBProvider::builder(self.data_dir().rocksdb())
-                .with_default_tables()
-                .with_metrics()
-                .with_statistics()
-                .build()?
-        };
-
         let prune_config = self.prune_config();
-        let factory = ProviderFactory::new(
-            self.right().clone(),
-            self.chain_spec(),
-            static_file_provider,
-            rocksdb_provider,
-            self.task_executor().clone(),
-        )?
+        let factory = if let Some(provider) = rocksdb_provider {
+            ProviderFactory::new(
+                self.right().clone(),
+                self.chain_spec(),
+                static_file_provider,
+                provider,
+                self.task_executor().clone(),
+            )?
+        } else {
+            let probe_factory = ProviderFactory::new(
+                self.right().clone(),
+                self.chain_spec(),
+                static_file_provider.clone(),
+                RocksDBProvider::noop(),
+                self.task_executor().clone(),
+            )?;
+            let storage_settings = probe_factory
+                .storage_settings()?
+                .unwrap_or_else(|| self.node_config().storage_settings());
+
+            if storage_settings.storage_v2 {
+                let rocksdb_provider = RocksDBProvider::builder(self.data_dir().rocksdb())
+                    .with_default_tables()
+                    .with_metrics()
+                    .with_statistics()
+                    .build()?;
+                ProviderFactory::new(
+                    self.right().clone(),
+                    self.chain_spec(),
+                    static_file_provider,
+                    rocksdb_provider,
+                    self.task_executor().clone(),
+                )?
+            } else {
+                probe_factory
+            }
+        }
         .with_prune_modes(prune_config.segments)
         .with_minimum_pruning_distance(prune_config.minimum_pruning_distance)
         .with_changeset_cache(changeset_cache);

@@ -12,7 +12,10 @@ use reth_ethereum::{
     chainspec::ChainSpec,
     node::{
         builder::{NodeBuilder, NodeHandle},
-        core::{args::RpcServerArgs, node_config::NodeConfig},
+        core::{
+            args::{RpcServerArgs, StorageArgs},
+            node_config::NodeConfig,
+        },
         EthereumNode,
     },
     provider::CanonStateSubscriptions,
@@ -27,11 +30,13 @@ async fn main() -> eyre::Result<()> {
     // create node config
     let node_config = NodeConfig::test()
         .dev()
+        .with_storage(StorageArgs { v2: false })
         .with_rpc(RpcServerArgs::default().with_http())
         .with_chain(custom_chain());
 
     let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config)
-        .testing_node(runtime)
+        .with_memory_database()
+        .with_launch_context(runtime)
         .node(EthereumNode::default())
         .launch_with_debug_capabilities()
         .await?;
