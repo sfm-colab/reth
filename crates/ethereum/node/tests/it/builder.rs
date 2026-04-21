@@ -8,6 +8,7 @@ use reth_db::{
 };
 use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_builder::{EngineNodeLauncher, FullNodeComponents, NodeBuilder, NodeConfig};
+use reth_node_core::args::StorageArgs;
 use reth_node_ethereum::node::{EthereumAddOns, EthereumNode};
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_builder::Identity;
@@ -116,4 +117,13 @@ fn test_node_setup() {
     let db = create_test_rw_db();
     let _builder =
         NodeBuilder::new(config).with_database(db).node(EthereumNode::default()).check_launch();
+}
+
+#[test]
+fn test_node_setup_with_memory_database() {
+    let config = NodeConfig::test().with_storage(StorageArgs { v2: false });
+    let _builder = NodeBuilder::new(config)
+        .with_memory_database()
+        .node(EthereumNode::default())
+        .check_launch();
 }

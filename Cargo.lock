@@ -9046,6 +9046,7 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-db-common",
+ "reth-db-mem",
  "reth-downloaders",
  "reth-engine-local",
  "reth-engine-primitives",
