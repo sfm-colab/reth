@@ -507,8 +507,9 @@ where
                 RocksDBProvider::noop(),
                 self.task_executor().clone(),
             )?;
-            let storage_settings =
-                probe_factory.storage_settings()?.unwrap_or(self.node_config().storage_settings());
+            let storage_settings = probe_factory
+                .storage_settings()?
+                .unwrap_or_else(|| self.node_config().storage_settings());
 
             if storage_settings.storage_v2 {
                 let rocksdb_provider = RocksDBProvider::builder(self.data_dir().rocksdb())
