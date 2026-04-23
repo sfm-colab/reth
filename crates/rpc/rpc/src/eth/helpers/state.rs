@@ -34,6 +34,7 @@ where
             .map_err(Self::Error::from_eth_err)
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn state_at_block_id(
         &self,
         at: alloy_rpc_types_eth::BlockId,
