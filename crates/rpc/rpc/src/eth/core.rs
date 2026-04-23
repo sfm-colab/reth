@@ -24,7 +24,7 @@ use reth_rpc_eth_types::{
     builder::config::PendingBlockKind, receipt::EthReceiptConverter, EthApiError, EthStateCache,
     FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
 };
-use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader};
+use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader, StateProviderBox};
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
     Runtime,
@@ -36,6 +36,30 @@ use reth_transaction_pool::{
 use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 const DEFAULT_BROADCAST_CAPACITY: usize = 2000;
+
+/// Optional wrapper applied to `StateProviderBox` values before they reach ETH RPC handlers.
+#[derive(Clone)]
+pub struct StateProviderInterceptor(
+    Arc<dyn Fn(StateProviderBox) -> StateProviderBox + Send + Sync>,
+);
+
+impl StateProviderInterceptor {
+    /// Creates a new interceptor from the provided callback.
+    pub fn new(f: impl Fn(StateProviderBox) -> StateProviderBox + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Applies the interceptor to the given state provider.
+    pub fn wrap(&self, state: StateProviderBox) -> StateProviderBox {
+        (self.0)(state)
+    }
+}
+
+impl std::fmt::Debug for StateProviderInterceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StateProviderInterceptor").finish()
+    }
+}
 
 /// Helper type alias for [`RpcConverter`] with components from the given [`FullNodeComponents`].
 pub type EthRpcConverterFor<N, NetworkT = Ethereum> = RpcConverter<
@@ -274,6 +298,9 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     /// Configuration for pending block construction.
     pending_block_kind: PendingBlockKind,
 
+    /// Optional interceptor that wraps every `StateProviderBox` before it reaches RPC handlers.
+    interceptor: Option<StateProviderInterceptor>,
+
     /// Timeout duration for `send_raw_transaction_sync` RPC method.
     send_raw_transaction_sync_timeout: Duration,
 
@@ -310,6 +337,7 @@ where
         max_batch_size: usize,
         max_blocking_io_requests: usize,
         pending_block_kind: PendingBlockKind,
+        interceptor: Option<StateProviderInterceptor>,
         raw_tx_forwarder: Option<RpcClient>,
         send_raw_transaction_sync_timeout: Duration,
         evm_memory_limit: u64,
@@ -355,11 +383,25 @@ where
             next_env_builder: Box::new(next_env),
             tx_batch_sender,
             pending_block_kind,
+            interceptor,
             send_raw_transaction_sync_timeout,
             blob_sidecar_converter: BlobSidecarConverter::new(),
             evm_memory_limit,
             force_blob_sidecar_upcasting,
         }
+    }
+
+    /// Wraps the state provider if an interceptor is configured.
+    pub fn wrap_state(&self, state: StateProviderBox) -> StateProviderBox {
+        match &self.interceptor {
+            Some(interceptor) => interceptor.wrap(state),
+            None => state,
+        }
+    }
+
+    /// Sets the interceptor used to wrap returned state providers.
+    pub fn set_interceptor(&mut self, interceptor: Option<StateProviderInterceptor>) {
+        self.interceptor = interceptor;
     }
 }
 
