@@ -7542,6 +7542,7 @@ dependencies = [
  "alloy-chains",
  "alloy-consensus",
  "alloy-eips 2.0.0",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "arbitrary",

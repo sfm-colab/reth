@@ -93,6 +93,9 @@ pub use block_writer::*;
 mod state_writer;
 pub use state_writer::*;
 
+mod state_dump;
+pub use state_dump::*;
+
 mod header_sync_gap;
 pub use header_sync_gap::HeaderSyncGapProvider;
 
