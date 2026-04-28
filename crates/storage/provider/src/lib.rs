@@ -15,6 +15,8 @@
 /// Utility functions for initializing the database.
 pub mod init;
 
+mod state_dump;
+
 /// Various provider traits.
 mod traits;
 pub use traits::*;
