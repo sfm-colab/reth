@@ -201,6 +201,10 @@ export const rethCliSidebar: SidebarItem = {
                 {
                     text: "reth db state",
                     link: "/cli/reth/db/state"
+                },
+                {
+                    text: "reth db migrate-v2",
+                    link: "/cli/reth/db/migrate-v2"
                 }
             ]
         },
