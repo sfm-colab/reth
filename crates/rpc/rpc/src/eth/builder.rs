@@ -1,6 +1,9 @@
 //! `EthApiBuilder` implementation
 
-use crate::{eth::core::EthApiInner, EthApi};
+use crate::{
+    eth::core::{EthApiInner, StateProviderInterceptor},
+    EthApi,
+};
 use alloy_network::Ethereum;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::ChainSpecProvider;
@@ -18,6 +21,7 @@ use reth_rpc_server_types::constants::{
     DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_BLOCKING_IO_REQUEST, DEFAULT_MAX_SIMULATE_BLOCKS,
     DEFAULT_PROOF_PERMITS,
 };
+use reth_storage_api::StateProviderBox;
 use reth_tasks::{pool::BlockingTaskPool, Runtime};
 use std::{sync::Arc, time::Duration};
 
@@ -44,6 +48,7 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     max_batch_size: usize,
     max_blocking_io_requests: usize,
     pending_block_kind: PendingBlockKind,
+    interceptor: Option<StateProviderInterceptor>,
     raw_tx_forwarder: ForwardConfig,
     send_raw_transaction_sync_timeout: Duration,
     evm_memory_limit: u64,
@@ -97,6 +102,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -120,6 +126,7 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -154,6 +161,7 @@ where
             max_batch_size: 1,
             max_blocking_io_requests: DEFAULT_MAX_BLOCKING_IO_REQUEST,
             pending_block_kind: PendingBlockKind::Full,
+            interceptor: None,
             raw_tx_forwarder: ForwardConfig::default(),
             send_raw_transaction_sync_timeout: Duration::from_secs(30),
             evm_memory_limit: (1 << 32) - 1,
@@ -195,6 +203,7 @@ where
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -218,6 +227,7 @@ where
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -248,6 +258,7 @@ where
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -271,6 +282,7 @@ where
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -361,6 +373,16 @@ where
     /// Sets the pending block kind
     pub const fn pending_block_kind(mut self, pending_block_kind: PendingBlockKind) -> Self {
         self.pending_block_kind = pending_block_kind;
+        self
+    }
+
+    /// Sets an interceptor that wraps every `StateProviderBox` returned through the ETH load
+    /// state helpers.
+    pub fn interceptor(
+        mut self,
+        f: impl Fn(StateProviderBox) -> StateProviderBox + Send + Sync + 'static,
+    ) -> Self {
+        self.interceptor = Some(StateProviderInterceptor::new(f));
         self
     }
 
@@ -507,6 +529,7 @@ where
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder,
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
@@ -559,6 +582,7 @@ where
             max_batch_size,
             max_blocking_io_requests,
             pending_block_kind,
+            interceptor,
             raw_tx_forwarder.forwarder_client(),
             send_raw_transaction_sync_timeout,
             evm_memory_limit,

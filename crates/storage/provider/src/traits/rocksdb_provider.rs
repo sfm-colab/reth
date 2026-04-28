@@ -2,7 +2,6 @@ use crate::{
     either_writer::{RawRocksDBBatch, RocksBatchArg, RocksDBRefArg},
     providers::RocksDBProvider,
 };
-use reth_storage_api::StorageSettingsCache;
 use reth_storage_errors::provider::ProviderResult;
 
 /// `RocksDB` provider factory.
@@ -36,15 +35,14 @@ pub trait RocksDBProviderFactory {
     /// was created.
     fn with_rocksdb_snapshot<F, R>(&self, f: F) -> ProviderResult<R>
     where
-        Self: StorageSettingsCache,
         F: FnOnce(RocksDBRefArg<'_>) -> ProviderResult<R>,
     {
-        if self.cached_storage_settings().storage_v2 {
-            let rocksdb = self.rocksdb_provider();
-            let snapshot = rocksdb.snapshot();
-            return f(Some(snapshot));
+        let rocksdb = self.rocksdb_provider();
+        if rocksdb.is_noop() {
+            return f(None);
         }
-        f(None)
+        let snapshot = rocksdb.snapshot();
+        f(Some(snapshot))
     }
 
     /// Executes a closure with a `RocksDB` batch, automatically registering it for commit.
@@ -55,9 +53,12 @@ pub trait RocksDBProviderFactory {
         F: FnOnce(RocksBatchArg<'_>) -> ProviderResult<(R, Option<RawRocksDBBatch>)>,
     {
         let rocksdb = self.rocksdb_provider();
+        let is_noop = rocksdb.is_noop();
         let batch = rocksdb.batch();
         let (result, raw_batch) = f(batch)?;
-        if let Some(b) = raw_batch {
+        if let Some(b) = raw_batch &&
+            !is_noop
+        {
             self.set_pending_rocksdb_batch(b);
         }
         Ok(result)
@@ -73,9 +74,12 @@ pub trait RocksDBProviderFactory {
         F: FnOnce(RocksBatchArg<'_>) -> ProviderResult<(R, Option<RawRocksDBBatch>)>,
     {
         let rocksdb = self.rocksdb_provider();
+        let is_noop = rocksdb.is_noop();
         let batch = rocksdb.batch_with_auto_commit();
         let (result, raw_batch) = f(batch)?;
-        if let Some(b) = raw_batch {
+        if let Some(b) = raw_batch &&
+            !is_noop
+        {
             self.set_pending_rocksdb_batch(b);
         }
         Ok(result)
@@ -107,7 +111,7 @@ mod tests {
         }
     }
 
-    /// Test provider that implements [`RocksDBProviderFactory`] + [`StorageSettingsCache`].
+    /// Test provider that returns either a real or noop `RocksDB` provider depending on settings.
     struct TestProvider {
         settings: StorageSettings,
         mock_rocksdb: MockRocksDBProvider,
@@ -128,16 +132,11 @@ mod tests {
         }
     }
 
-    impl StorageSettingsCache for TestProvider {
-        fn cached_storage_settings(&self) -> StorageSettings {
-            self.settings
-        }
-
-        fn set_storage_settings_cache(&self, _settings: StorageSettings) {}
-    }
-
     impl RocksDBProviderFactory for TestProvider {
         fn rocksdb_provider(&self) -> RocksDBProvider {
+            if !self.settings.storage_v2 {
+                return RocksDBProvider::noop();
+            }
             self.mock_rocksdb.increment_tx_count();
             RocksDBProvider::new(self.temp_dir.path()).unwrap()
         }
@@ -181,6 +180,40 @@ mod tests {
             provider.tx_call_count(),
             1,
             "should create RocksDB provider when storage_v2 is true"
+        );
+    }
+
+    #[test]
+    fn test_legacy_settings_skip_rocksdb_batch() {
+        let provider = TestProvider::new(StorageSettings::v1());
+
+        let result = provider.with_rocksdb_batch(|batch| {
+            assert!(batch.is_empty(), "legacy settings should provide a noop batch");
+            Ok((42, None))
+        });
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            provider.tx_call_count(),
+            0,
+            "should not create RocksDB provider for legacy batch writes"
+        );
+    }
+
+    #[test]
+    fn test_legacy_settings_skip_rocksdb_batch_auto_commit() {
+        let provider = TestProvider::new(StorageSettings::v1());
+
+        let result = provider.with_rocksdb_batch_auto_commit(|batch| {
+            assert!(batch.is_empty(), "legacy settings should provide a noop batch");
+            Ok((42, None))
+        });
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            provider.tx_call_count(),
+            0,
+            "should not create RocksDB provider for legacy auto-commit batch writes"
         );
     }
 }

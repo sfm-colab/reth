@@ -14,6 +14,7 @@ use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use futures::Future;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_db_api::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db_mem::MemoryDatabase;
 use reth_exex::ExExContext;
 use reth_network::{
     transactions::{
@@ -232,6 +233,16 @@ impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
     /// Configures the underlying database that the node will use.
     pub fn with_database<D>(self, database: D) -> NodeBuilder<D, ChainSpec> {
         NodeBuilder { config: self.config, database, rocksdb_provider: self.rocksdb_provider }
+    }
+
+    /// Configures the node to use the in-memory database backend.
+    ///
+    /// This is useful for embedded or ephemeral nodes that don't want an MDBX-backed database.
+    ///
+    /// Note: for a fully in-memory storage stack, pair this with legacy storage
+    /// (`StorageArgs { v2: false }`) so launch can skip auxiliary `RocksDB`.
+    pub fn with_memory_database(self) -> NodeBuilder<Arc<MemoryDatabase>, ChainSpec> {
+        self.with_database(Arc::new(MemoryDatabase::new()))
     }
 
     /// Sets the [`RocksDBProvider`] to use instead of creating one during launch.
