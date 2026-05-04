@@ -609,17 +609,24 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        let mut pending_error = None;
 
         // check if there is a better payload before returning the best payload
         if let Some(fut) = Pin::new(&mut this.maybe_better).as_pin_mut() &&
             let Poll::Ready(res) = fut.poll(cx)
         {
             this.maybe_better = None;
-            if let Ok(Some(payload)) = res.map(|out| out.into_payload()).inspect_err(
-                |err| warn!(target: "payload_builder", %err, "failed to resolve pending payload"),
-            ) {
-                debug!(target: "payload_builder", "resolving better payload");
-                return Poll::Ready(Ok(payload))
+            match res {
+                Ok(outcome) => {
+                    if let Some(payload) = outcome.into_payload() {
+                        debug!(target: "payload_builder", "resolving better payload");
+                        return Poll::Ready(Ok(payload))
+                    }
+                }
+                Err(err) => {
+                    warn!(target: "payload_builder", %err, "failed to resolve pending payload");
+                    pending_error = Some(err);
+                }
             }
         }
 
@@ -646,6 +653,9 @@ where
         }
 
         if this.is_empty() {
+            if let Some(err) = pending_error {
+                return Poll::Ready(Err(err))
+            }
             return Poll::Ready(Err(PayloadBuilderError::MissingPayload))
         }
 

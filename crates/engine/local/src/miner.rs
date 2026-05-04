@@ -1,13 +1,16 @@
 //! Contains the implementation of the mining mode for the local engine.
 
 use alloy_primitives::{TxHash, B256};
-use alloy_rpc_types_engine::ForkchoiceState;
-use eyre::OptionExt;
+use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
 use futures_util::{stream::Fuse, Stream, StreamExt};
-use reth_engine_primitives::ConsensusEngineHandle;
+use reth_engine_primitives::{
+    BeaconForkChoiceUpdateError, BeaconOnNewPayloadError, ConsensusEngineHandle,
+};
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{HeaderTy, SealedHeaderFor};
+use reth_payload_primitives::{
+    BuiltPayload, PayloadAttributesBuilder, PayloadBuilderError, PayloadKind, PayloadTypes,
+};
+use reth_primitives_traits::{HeaderTy, SealedHeader, SealedHeaderFor};
 use reth_storage_api::BlockReader;
 use reth_transaction_pool::TransactionPool;
 use std::{
@@ -18,9 +21,114 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::time::Interval;
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Interval,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
+
+/// Handle used to control a running [`LocalMiner`].
+pub struct LocalMinerHandle<H> {
+    tx: mpsc::UnboundedSender<LocalMinerCommand<H>>,
+}
+
+impl<H> Clone for LocalMinerHandle<H> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone() }
+    }
+}
+
+impl<H> fmt::Debug for LocalMinerHandle<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalMinerHandle").finish_non_exhaustive()
+    }
+}
+
+impl<H> LocalMinerHandle<H> {
+    /// Creates a miner handle and the matching control receiver.
+    pub fn new() -> (Self, LocalMinerControl<H>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx }, LocalMinerControl { rx })
+    }
+
+    /// Resets the miner's local forkchoice head.
+    ///
+    /// This is intended for local-dev flows that externally rewind the canonical chain, such as
+    /// Anvil snapshot reverts. The returned future resolves after the running miner has applied
+    /// the new head and sent a forkchoice update to the engine.
+    pub async fn reset_head(&self, header: SealedHeader<H>) -> Result<(), LocalMinerError> {
+        let (response, result) = oneshot::channel();
+        self.tx
+            .send(LocalMinerCommand::ResetHead { header, response })
+            .map_err(|_| LocalMinerError::TaskUnavailable)?;
+
+        result.await.map_err(|_| LocalMinerError::ResponseDropped("reset"))?
+    }
+
+    /// Mines one block immediately and updates forkchoice to the mined block.
+    ///
+    /// This bypasses the configured mining mode trigger and waits until the local miner has built
+    /// and canonicalized the new block, returning its sealed header.
+    pub async fn mine_one(&self) -> Result<SealedHeader<H>, LocalMinerError> {
+        let (response, result) = oneshot::channel();
+        self.tx
+            .send(LocalMinerCommand::MineOne { response })
+            .map_err(|_| LocalMinerError::TaskUnavailable)?;
+
+        result.await.map_err(|_| LocalMinerError::ResponseDropped("mine"))?
+    }
+}
+
+/// Errors returned when controlling a running [`LocalMiner`].
+#[derive(Debug, thiserror::Error)]
+pub enum LocalMinerError {
+    /// The local miner task is no longer running.
+    #[error("local miner task is not running")]
+    TaskUnavailable,
+    /// The local miner task dropped the request response channel.
+    #[error("local miner task dropped the {0} response")]
+    ResponseDropped(&'static str),
+    /// The engine rejected or failed a forkchoice update.
+    #[error(transparent)]
+    ForkchoiceUpdate(#[from] BeaconForkChoiceUpdateError),
+    /// The engine rejected or failed a new payload.
+    #[error(transparent)]
+    NewPayload(#[from] BeaconOnNewPayloadError),
+    /// The payload builder failed to produce a payload.
+    #[error(transparent)]
+    PayloadBuilder(#[from] PayloadBuilderError),
+    /// The forkchoice update response was not valid.
+    #[error("invalid forkchoice update {state:?}: {response:?}")]
+    InvalidForkchoiceUpdate {
+        /// Requested forkchoice state.
+        state: ForkchoiceState,
+        /// Engine response.
+        response: ForkchoiceUpdated,
+    },
+    /// The forkchoice update response did not include a payload id.
+    #[error("missing payload id in forkchoice update response")]
+    MissingPayloadId,
+    /// The new payload response was not valid.
+    #[error("invalid payload: {0:?}")]
+    InvalidPayload(PayloadStatus),
+}
+
+/// Receiver side for [`LocalMinerHandle`].
+pub struct LocalMinerControl<H> {
+    rx: mpsc::UnboundedReceiver<LocalMinerCommand<H>>,
+}
+
+impl<H> fmt::Debug for LocalMinerControl<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalMinerControl").finish_non_exhaustive()
+    }
+}
+
+enum LocalMinerCommand<H> {
+    ResetHead { header: SealedHeader<H>, response: oneshot::Sender<Result<(), LocalMinerError>> },
+    MineOne { response: oneshot::Sender<Result<SealedHeader<H>, LocalMinerError>> },
+}
 
 /// A mining mode for the local dev engine.
 pub enum MiningMode<Pool: TransactionPool + Unpin> {
@@ -146,6 +254,8 @@ pub struct LocalMiner<T: PayloadTypes, B, Pool: TransactionPool + Unpin> {
     /// When set, the miner sleeps after `fork_choice_updated` before calling
     /// `resolve_kind`, giving the payload job time for multiple rebuild attempts.
     payload_wait_time: Option<Duration>,
+    /// Optional local control channel.
+    control: Option<LocalMinerControl<HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
 }
 
 impl<T, B, Pool> LocalMiner<T, B, Pool>
@@ -176,6 +286,7 @@ where
             last_block_hashes: VecDeque::from([last_header.hash()]),
             last_header,
             payload_wait_time: None,
+            control: None,
         }
     }
 
@@ -185,25 +296,94 @@ where
         self
     }
 
+    /// Sets a control receiver for this local miner.
+    pub fn with_control(
+        mut self,
+        control: LocalMinerControl<HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
+    ) -> Self {
+        self.control = Some(control);
+        self
+    }
+
     /// Runs the [`LocalMiner`] in a loop, polling the miner and building payloads.
     pub async fn run(mut self) {
         let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut control = self.control.take();
+
         loop {
-            tokio::select! {
-                // Wait for the interval or the pool to receive a transaction
-                _ = &mut self.mode => {
-                    if let Err(e) = self.advance().await {
-                        error!(target: "engine::local", "Error advancing the chain: {:?}", e);
+            if let Some(control_rx) = control.as_mut() {
+                tokio::select! {
+                    command = control_rx.rx.recv() => {
+                        if let Some(command) = command {
+                            self.handle_control_command(command).await;
+                        } else {
+                            control = None;
+                        }
+                    }
+                    // Wait for the interval or the pool to receive a transaction
+                    _ = &mut self.mode => {
+                        if let Err(e) = self.advance().await {
+                            error!(target: "engine::local", "Error advancing the chain: {:?}", e);
+                        }
+                    }
+                    // send FCU once in a while
+                    _ = fcu_interval.tick() => {
+                        if let Err(e) = self.update_forkchoice_state().await {
+                            error!(target: "engine::local", "Error updating fork choice: {:?}", e);
+                        }
                     }
                 }
-                // send FCU once in a while
-                _ = fcu_interval.tick() => {
-                    if let Err(e) = self.update_forkchoice_state().await {
-                        error!(target: "engine::local", "Error updating fork choice: {:?}", e);
+            } else {
+                tokio::select! {
+                    // Wait for the interval or the pool to receive a transaction
+                    _ = &mut self.mode => {
+                        if let Err(e) = self.advance().await {
+                            error!(target: "engine::local", "Error advancing the chain: {:?}", e);
+                        }
+                    }
+                    // send FCU once in a while
+                    _ = fcu_interval.tick() => {
+                        if let Err(e) = self.update_forkchoice_state().await {
+                            error!(target: "engine::local", "Error updating fork choice: {:?}", e);
+                        }
                     }
                 }
             }
         }
+    }
+
+    async fn handle_control_command(
+        &mut self,
+        command: LocalMinerCommand<HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
+    ) {
+        match command {
+            LocalMinerCommand::ResetHead { header, response } => {
+                let result = self.reset_head(header).await;
+                let _ = response.send(result);
+            }
+            LocalMinerCommand::MineOne { response } => {
+                let result = self.mine_one().await;
+                let _ = response.send(result);
+            }
+        }
+    }
+
+    async fn reset_head(
+        &mut self,
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> Result<(), LocalMinerError> {
+        self.last_block_hashes = VecDeque::from([header.hash()]);
+        self.last_header = header;
+        self.update_forkchoice_state().await
+    }
+
+    async fn mine_one(
+        &mut self,
+    ) -> Result<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>, LocalMinerError>
+    {
+        let header = self.advance().await?;
+        self.update_forkchoice_state().await?;
+        Ok(header)
     }
 
     /// Returns current forkchoice state.
@@ -222,12 +402,12 @@ where
     }
 
     /// Sends a FCU to the engine.
-    async fn update_forkchoice_state(&self) -> eyre::Result<()> {
+    async fn update_forkchoice_state(&self) -> Result<(), LocalMinerError> {
         let state = self.forkchoice_state();
         let res = self.to_engine.fork_choice_updated(state, None).await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid fork choice update {state:?}: {res:?}")
+            return Err(LocalMinerError::InvalidForkchoiceUpdate { state, response: res })
         }
 
         Ok(())
@@ -235,29 +415,37 @@ where
 
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
     /// through newPayload.
-    async fn advance(&mut self) -> eyre::Result<()> {
+    async fn advance(
+        &mut self,
+    ) -> Result<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>, LocalMinerError>
+    {
+        let state = self.forkchoice_state();
         let res = self
             .to_engine
             .fork_choice_updated(
-                self.forkchoice_state(),
+                state,
                 Some(self.payload_attributes_builder.build(&self.last_header)),
             )
             .await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid payload status")
+            return Err(LocalMinerError::InvalidForkchoiceUpdate { state, response: res })
         }
 
-        let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
+        let payload_id = res.payload_id.ok_or(LocalMinerError::MissingPayloadId)?;
 
         if let Some(wait_time) = self.payload_wait_time {
             tokio::time::sleep(wait_time).await;
         }
 
-        let Some(Ok(payload)) =
-            self.payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending).await
-        else {
-            eyre::bail!("No payload")
+        let payload = match self
+            .payload_builder
+            .resolve_kind(payload_id, PayloadKind::WaitForPending)
+            .await
+        {
+            Some(Ok(payload)) => payload,
+            Some(Err(error)) => return Err(error.into()),
+            None => return Err(PayloadBuilderError::MissingPayload.into()),
         };
 
         let header = payload.block().sealed_header().clone();
@@ -265,16 +453,16 @@ where
         let res = self.to_engine.new_payload(payload).await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid payload")
+            return Err(LocalMinerError::InvalidPayload(res))
         }
 
         self.last_block_hashes.push_back(header.hash());
-        self.last_header = header;
+        self.last_header = header.clone();
         // ensure we keep at most 64 blocks
         if self.last_block_hashes.len() > 64 {
             self.last_block_hashes.pop_front();
         }
 
-        Ok(())
+        Ok(header)
     }
 }
