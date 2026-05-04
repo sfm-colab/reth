@@ -11,5 +11,5 @@
 pub mod miner;
 pub mod payload;
 
-pub use miner::{LocalMiner, MiningMode};
+pub use miner::{LocalMiner, LocalMinerControl, LocalMinerError, LocalMinerHandle, MiningMode};
 pub use payload::LocalPayloadAttributesBuilder;

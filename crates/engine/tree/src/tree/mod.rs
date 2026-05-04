@@ -989,7 +989,7 @@ where
     /// Handles chain unwind scenarios by collecting blocks to remove and performing an unwind back
     /// to the canonical header
     fn handle_canonical_chain_unwind(
-        &self,
+        &mut self,
         current_head_number: u64,
         canonical_header: &SealedHeader<N::BlockHeader>,
     ) -> ProviderResult<()> {
@@ -1005,8 +1005,17 @@ where
         let old_blocks =
             self.collect_blocks_for_canonical_unwind(new_head_number, current_head_number);
 
-        // Load and apply the canonical ancestor block
-        self.apply_canonical_ancestor_via_reorg(canonical_header, old_blocks)
+        // Load the canonical ancestor before resetting tree state because the canonical state may
+        // currently live only in the in-memory tree.
+        let executed_block = self.canonical_block_by_hash(canonical_header.hash())?;
+
+        // Drop executed descendants from tree state so a rebuilt payload at the same height is not
+        // treated as an already-seen block after the unwind.
+        self.state.tree_state.reset(canonical_header.num_hash());
+        self.metrics.engine.executed_blocks.set(self.state.tree_state.block_count() as f64);
+
+        // Apply the canonical ancestor block
+        self.apply_canonical_ancestor_via_reorg(canonical_header, old_blocks, executed_block)
     }
 
     /// Collects blocks from memory that need to be removed during an unwind to a canonical block.
@@ -1045,12 +1054,11 @@ where
         &self,
         canonical_header: &SealedHeader<N::BlockHeader>,
         old_blocks: Vec<ExecutedBlock<N>>,
+        executed_block: ExecutedBlock<N>,
     ) -> ProviderResult<()> {
         let new_head_hash = canonical_header.hash();
         let new_head_number = canonical_header.number();
 
-        // Load the canonical ancestor's block
-        let executed_block = self.canonical_block_by_hash(new_head_hash)?;
         // Perform the reorg to properly handle the unwind
         self.canonical_in_memory_state
             .update_chain(NewCanonicalChain::Reorg { new: vec![executed_block], old: old_blocks });

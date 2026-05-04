@@ -7,7 +7,7 @@ use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{
     BlockProvider, DebugConsensusClient, EtherscanBlockProvider, RpcBlockProvider,
 };
-use reth_engine_local::{LocalMiner, MiningMode};
+use reth_engine_local::{LocalMiner, LocalMinerControl, MiningMode};
 use reth_node_api::{
     BlockTy, FullNodeComponents, FullNodeTypes, HeaderTy, PayloadAttrTy, PayloadAttributesBuilder,
     PayloadTypes,
@@ -133,6 +133,7 @@ where
         Option<Box<dyn Fn(PayloadAttrTy<N::Types>) -> PayloadAttrTy<N::Types> + Send + Sync>>,
     debug_block_provider: Option<B>,
     mining_mode: Option<MiningMode<N::Pool>>,
+    local_miner_control: Option<LocalMinerControl<HeaderTy<N::Types>>>,
 }
 
 impl<L, Target, N, AddOns, B> DebugNodeLauncherFuture<L, Target, N, B>
@@ -154,6 +155,7 @@ where
             map_attributes: None,
             debug_block_provider: self.debug_block_provider,
             mining_mode: self.mining_mode,
+            local_miner_control: self.local_miner_control,
         }
     }
 
@@ -169,6 +171,7 @@ where
             map_attributes: Some(Box::new(f)),
             debug_block_provider: self.debug_block_provider,
             mining_mode: self.mining_mode,
+            local_miner_control: self.local_miner_control,
         }
     }
 
@@ -178,6 +181,18 @@ where
     /// (instant or interval). This can be used to provide a custom trigger-based mining mode.
     pub fn with_mining_mode(mut self, mode: MiningMode<N::Pool>) -> Self {
         self.mining_mode = Some(mode);
+        self
+    }
+
+    /// Sets a control receiver for the local miner in dev mode.
+    ///
+    /// This can be paired with a [`reth_engine_local::LocalMinerHandle`] to reset the miner's
+    /// local forkchoice head after external dev-chain rewinds.
+    pub fn with_local_miner_control(
+        mut self,
+        control: LocalMinerControl<HeaderTy<N::Types>>,
+    ) -> Self {
+        self.local_miner_control = Some(control);
         self
     }
 
@@ -199,6 +214,7 @@ where
             map_attributes: self.map_attributes,
             debug_block_provider: Some(provider),
             mining_mode: self.mining_mode,
+            local_miner_control: self.local_miner_control,
         }
     }
 
@@ -210,6 +226,7 @@ where
             map_attributes,
             debug_block_provider,
             mining_mode,
+            local_miner_control,
         } = self;
 
         let handle = inner.launch_node(target).await?;
@@ -316,16 +333,20 @@ where
                 );
             }
             handle.node.task_executor.spawn_critical_task("local engine", async move {
-                LocalMiner::new(
+                let miner = LocalMiner::new(
                     blockchain_db,
                     builder,
                     beacon_engine_handle,
                     dev_mining_mode,
                     payload_builder_handle,
                 )
-                .with_payload_wait_time_opt(payload_wait_time)
-                .run()
-                .await
+                .with_payload_wait_time_opt(payload_wait_time);
+
+                if let Some(control) = local_miner_control {
+                    miner.with_control(control).run().await
+                } else {
+                    miner.run().await
+                }
             });
         }
 
@@ -368,6 +389,7 @@ where
             map_attributes: None,
             debug_block_provider: None,
             mining_mode: None,
+            local_miner_control: None,
         }
     }
 }
